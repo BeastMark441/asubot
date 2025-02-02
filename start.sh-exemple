@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# Установка часового пояса Барнаула
+export TZ="Asia/Barnaul"
+
+# Установка переменных окружения
+export BOT_TOKEN="bot_token"
+export ASU_API_TOKEN="asu_token"
+export ASU_API_URL="https://www.asu.ru"
+export DB_HOST="localhost"
+export DB_USER="user"
+export DB_PASSWORD="password"
+export DB_NAME="database"
+export DB_PORT="3306"
+export ADMIN_IDS="983524946,123456789"
+
+# Запуск бота
+python main.py 
