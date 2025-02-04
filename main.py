@@ -14,6 +14,7 @@ from json import dumps, loads
 import psutil
 import matplotlib.pyplot as plt
 import io
+import signal
 
 def setup_logging():
     # Создаем директорию для логов если её нет
@@ -931,8 +932,9 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             try:
-                # table_name уже содержит кавычки для зарезервированных слов
-                cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+                # Экранируем имя таблицы
+                safe_table_name = f"`{table_name.strip('`')}`"
+                cursor.execute(f"SELECT COUNT(*) FROM {safe_table_name}")
                 return cursor.fetchone()[0]
             except mysql.connector.Error as err:
                 logging.error(f"Database error in get_table_count: {err}")
@@ -1153,17 +1155,8 @@ class TelegramBot:
         # Добавляем обработчик команды админа
         self.application.add_handler(CommandHandler("admin", self.admin_panel))
 
-        # Задаем фиксированные времена для проверки уведомлений
-        self.notification_times = ['08:00', '12:00', '16:00', '20:00', '22:00']
-        
-        # Добавляем задачи для каждого времени уведомления
-        for time_str in self.notification_times:
-            hour, minute = map(int, time_str.split(':'))
-            self.application.job_queue.run_daily(
-                self.check_notifications,
-                time=time(hour=hour, minute=minute),  # Используем time вместо datetime.time
-                name=f"notify_{time_str}"
-            )
+        # Настраиваем задания для уведомлений
+        self.setup_notification_jobs()
         
         # Добавляем задачу очистки кэша каждые 6 часов
         self.application.job_queue.run_repeating(
@@ -1173,7 +1166,16 @@ class TelegramBot:
         )
 
         # Инициализируем Redis кэш
-        self.redis_cache = RedisCache()
+        try:
+            self.redis_cache = RedisCache()
+        except Exception as e:
+            logging.error(f"Failed to initialize Redis cache: {e}")
+            self.redis_cache = None
+        
+        # Логируем информацию о настроенных заданиях
+        if hasattr(self.application.job_queue, 'jobs'):
+            jobs = self.application.job_queue.jobs()
+            logging.info(f"Scheduled jobs: {[job.name for job in jobs]}")
 
     async def _process_message_queue(self):
         """Обработка очереди сообщений"""
@@ -1194,35 +1196,65 @@ class TelegramBot:
             except Exception as e:
                 logging.error(f"Error processing message queue: {e}")
 
-    def run(self):
-        """Синхронный метод запуска бота"""
+    async def run(self):
+        """Асинхронный метод запуска бота"""
         try:
             logging.info("Starting bot...")
             print("Бот запущен...")
             
-            # Создаем и запускаем event loop
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
             # Запускаем обработчик очереди сообщений
-            self.queue_task = loop.create_task(self._process_message_queue())
+            self.queue_task = asyncio.create_task(self._process_message_queue())
             
             # Запускаем бота
-            self.application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-                close_loop=False
-            )
-        except KeyboardInterrupt:
-            logging.info("Shutting down bot...")
-            print("Завершение работы бота...")
-            if self.queue_task:
-                self.queue_task.cancel()
+            await self.application.initialize()
+            await self.application.start()
+            await self.application.updater.start_polling()
+            
+            # Ждем завершения
+            stop_signal = asyncio.Future()
+            await stop_signal
+            
         except Exception as e:
             logging.error(f"Error occurred: {e}")
             print(f"Произошла ошибка: {e}")
-            if self.queue_task:
+        finally:
+            await self.shutdown()
+
+    async def shutdown(self):
+        """Корректное завершение работы бота"""
+        try:
+            logging.info("Starting shutdown process...")
+            
+            # Отменяем задачу очереди сообщений
+            if self.queue_task and not self.queue_task.done():
                 self.queue_task.cancel()
+                try:
+                    await self.queue_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Останавливаем планировщик
+            if hasattr(self.application, 'job_queue'):
+                await self.application.job_queue.stop()
+
+            # Останавливаем updater если он запущен
+            if self.application.updater.running:
+                await self.application.updater.stop()
+
+            # Останавливаем бота
+            try:
+                await self.application.stop()
+                await self.application.shutdown()
+            except Exception as e:
+                logging.error(f"Error stopping application: {e}")
+                
+            # Закрываем API сессию
+            if hasattr(self.api, 'session') and self.api.session:
+                await self.api.close_session()
+                
+            logging.info("Shutdown completed successfully")
+        except Exception as e:
+            logging.error(f"Error during shutdown: {e}")
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Улучшенный обработчик ошибок"""
@@ -2299,317 +2331,55 @@ class TelegramBot:
             return False
 
     async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик текстовых сообщений"""
-        user_id = update.effective_user.id
-        message_text = update.message.text
-        username = update.effective_user.username
-
-        # Проверяем бан перед обработкой сообщения
-        if await self.check_ban(user_id):
-            await update.message.reply_text("⛔️ Вы заблокированы в боте")
-            return
-
-        # Обработка состояний
-        current_state = context.user_data.get('state')
-        
-        if current_state == 'waiting_for_broadcast':
-            if user_id not in ADMIN_IDS:
+        try:
+            # Проверяем наличие сообщения
+            if not update.message:
                 return
-            await self.process_broadcast(update, context)
-            return
-        
-        elif current_state == 'waiting_for_user_search':
-            if user_id not in ADMIN_IDS:
+            
+            # Получаем текст сообщения
+            message_text = update.message.text
+            if not message_text:
                 return
-            await self.process_user_search(update, context)
-            return
-        
-        elif current_state == 'waiting_for_techcard_search':
-            if user_id not in ADMIN_IDS:
-                return
-            await self.process_techcard_search(update, context)
-            return
-
-        # Обработка команд админа
-        if user_id in ADMIN_IDS:
-            if message_text.lower().startswith('инфо '):
-                try:
-                    target = message_text.split(' ')[1]
-                    if target.startswith('@'):
-                        user = self.db.get_user_by_username(target[1:])
-                    else:
-                        user = self.db.get_user_by_tg_id(int(target))
-                    
-                    if not user:
-                        await update.message.reply_text("❌ Пользователь не найден")
+            
+            # Проверяем тип чата
+            chat_type = update.message.chat.type
+            is_group_chat = chat_type in ['group', 'supergroup']
+            
+            # В групповых чатах обрабатываем только команды и ответы на сообщения бота
+            if is_group_chat:
+                # Проверяем, является ли сообщение командой
+                if not message_text.startswith('/'):
+                    # Проверяем, является ли сообщение ответом на сообщение бота
+                    if not (update.message.reply_to_message and 
+                           update.message.reply_to_message.from_user.id == context.bot.id):
                         return
                     
-                    user_info = self.db.get_user_info(user['tg_id'])
-                    if user_info:
-                        message = (
-                            f"👤 <b>Информация о пользователе</b>\n\n"
-                            f"ID: {user_info['tg_id']}\n"
-                            f"Username: @{user_info['username'] or 'нет'}\n"
-                            f"Забанен: {'Да' if user_info['is_banned'] else 'Нет'}\n"
-                            f"Дата регистрации: {user_info['created_at']}\n"
-                            f"Сохранённых групп: {user_info['groups_count']}\n"
-                            f"Сохранённых преподавателей: {user_info['lecturers_count']}\n\n"
-                        )
-                        
-                        if user_info['saved_groups']:
-                            message += "<b>Сохранённые группы:</b>\n"
-                            for group in user_info['saved_groups']:
-                                message += f"• {group['groupCode']}\n"
-                            message += "\n"
-                        
-                        if user_info['saved_lecturers']:
-                            message += "<b>Сохранённые преподаватели:</b>\n"
-                            for lecturer in user_info['saved_lecturers']:
-                                message += f"• {lecturer['lecturerName']}\n"
-                        
-                        await update.message.reply_text(message, parse_mode='HTML')
-                    else:
-                        await update.message.reply_text("❌ Ошибка получения информации о пользователе")
-                except Exception as e:
-                    logging.error(f"Error getting user info: {e}")
-                    await update.message.reply_text("❌ Ошибка при получении информации")
-                return
-
-            elif message_text.lower().startswith('бан '):
-                try:
-                    target = message_text.split(' ')[1]
-                    if target.startswith('@'):
-                        user = self.db.get_user_by_username(target[1:])
-                    else:
-                        user = self.db.get_user_by_tg_id(int(target))
-                    
-                    if not user:
-                        await update.message.reply_text("❌ Пользователь не найден")
-                        return
-                    
-                    if self.db.ban_user(user['tg_id']):
-                        await update.message.reply_text(f"✅ Пользователь {target} забанен")
-                    else:
-                        await update.message.reply_text("❌ Ошибка при бане пользователя")
-                except Exception as e:
-                    logging.error(f"Error banning user: {e}")
-                    await update.message.reply_text("❌ Ошибка при бане пользователя")
-                return
-
-            elif message_text.lower().startswith('разбан '):
-                try:
-                    target = message_text.split(' ')[1]
-                    if target.startswith('@'):
-                        user = self.db.get_user_by_username(target[1:])
-                    else:
-                        user = self.db.get_user_by_tg_id(int(target))
-                    
-                    if not user:
-                        await update.message.reply_text("❌ Пользователь не найден")
-                        return
-                    
-                    if self.db.unban_user(user['tg_id']):
-                        await update.message.reply_text(f"✅ Пользователь {target} разбанен")
-                    else:
-                        await update.message.reply_text("❌ Ошибка при разбане пользователя")
-                except Exception as e:
-                    logging.error(f"Error unbanning user: {e}")
-                    await update.message.reply_text("❌ Ошибка при разбане пользователя")
-                return
-
-            elif message_text.lower().startswith('удалить_группу '):
-                try:
-                    parts = message_text.split(' ', 2)
-                    if len(parts) != 3:
-                        await update.message.reply_text("❌ Неверный формат команды\nПример: удалить_группу 123456789 К402с9-1")
-                        return
-                    
-                    target_id = int(parts[1])
-                    group_code = parts[2].upper()
-                    
-                    success, msg = self.db.delete_user_group(target_id, group_code)
-                    if success:
-                        await update.message.reply_text(f"✅ {msg}")
-                    else:
-                        await update.message.reply_text(f"❌ {msg}")
-                except ValueError:
-                    await update.message.reply_text("❌ Неверный формат ID пользователя")
-                except Exception as e:
-                    logging.error(f"Error deleting user group: {e}")
-                    await update.message.reply_text("❌ Произошла ошибка при удалении группы")
-                return
-
-            elif message_text.lower().startswith('удалить_препод '):
-                try:
-                    parts = message_text.split(' ', 2)
-                    if len(parts) != 3:
-                        await update.message.reply_text("❌ Неверный формат команды\nПример: удалить_препод 123456789 Иванов")
-                        return
-                    
-                    target_id = int(parts[1])
-                    lecturer_name = parts[2]
-                    
-                    success, msg = self.db.delete_user_lecturer(target_id, lecturer_name)
-                    if success:
-                        await update.message.reply_text(f"✅ {msg}")
-                    else:
-                        await update.message.reply_text(f"❌ {msg}")
-                except ValueError:
-                    await update.message.reply_text("❌ Неверный формат ID пользователя")
-                except Exception as e:
-                    logging.error(f"Error deleting user lecturer: {e}")
-                    await update.message.reply_text("❌ Произошла ошибка при удалении преподавателя")
-                return
-
-        # Поиск групп
-        groups = self.db.search_groups(message_text)
-        if groups:
-            # Разбиваем результаты на страницы по 10 групп
-            GROUPS_PER_PAGE = 10
-            total_pages = (len(groups) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE
-            current_page = 1
-            
-            # Получаем группы для текущей страницы
-            start_idx = (current_page - 1) * GROUPS_PER_PAGE
-            end_idx = start_idx + GROUPS_PER_PAGE
-            current_groups = groups[start_idx:end_idx]
-            
-            keyboard = []
-            for group in current_groups:
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"📋 {group['groupCode']} ({group['facultyTitle']})",
-                        callback_data=f"group_{group['groupId']}"
-                    )
-                ])
-            
-            # Добавляем навигационные кнопки
-            nav_buttons = []
-            if total_pages > 1:
-                nav_buttons.append(
-                    InlineKeyboardButton(
-                        f"📄 Стр. {current_page}/{total_pages}",
-                        callback_data="current_page"
-                    )
-                )
-                if current_page < total_pages:
-                    nav_buttons.append(
-                        InlineKeyboardButton(
-                            "➡️ Следующая",
-                            callback_data=f"next_page_{message_text}_{current_page + 1}"
-                        )
-                    )
-            
-            if nav_buttons:
-                keyboard.append(nav_buttons)
-            
-            keyboard.append([InlineKeyboardButton("🔍 Новый поиск", callback_data='search_group')])
-            keyboard.append([InlineKeyboardButton("🔙 Вернуться в главное меню", callback_data='start')])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(
-                f"🔍 Результаты поиска группы ({len(groups)} найдено):\n"
-                "Выберите группу из списка:",
-                reply_markup=reply_markup
-            )
-            return
-
-        # Поиск преподавателей
-        lecturers = self.db.search_lecturers(message_text)
-        if lecturers:
-            # Разбиваем результаты на страницы по 10 преподавателей
-            LECTURERS_PER_PAGE = 10
-            total_pages = (len(lecturers) + LECTURERS_PER_PAGE - 1) // LECTURERS_PER_PAGE
-            current_page = 1
-            
-            # Получаем преподавателей для текущей страницы
-            start_idx = (current_page - 1) * LECTURERS_PER_PAGE
-            end_idx = start_idx + LECTURERS_PER_PAGE
-            current_lecturers = lecturers[start_idx:end_idx]
-            
-            keyboard = []
-            for lecturer in current_lecturers:
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"👨‍🏫 {lecturer['lecturerName']} ({lecturer['facultyTitle']})",
-                        callback_data=f"lecturer_{lecturer['lectureId']}"
-                    )
-                ])
-            
-            # Добавляем навигационные кнопки
-            nav_buttons = []
-            if total_pages > 1:
-                nav_buttons.append(
-                    InlineKeyboardButton(
-                        f"📄 Стр. {current_page}/{total_pages}",
-                        callback_data="current_page"
-                    )
-                )
-                if current_page < total_pages:
-                    nav_buttons.append(
-                        InlineKeyboardButton(
-                            "➡️ Следующая",
-                            callback_data=f"next_lecturer_{message_text}_{current_page + 1}"
-                        )
-                    )
-            
-            if nav_buttons:
-                keyboard.append(nav_buttons)
-            
-            keyboard.append([InlineKeyboardButton("🔍 Новый поиск", callback_data='search_lecturer')])
-            keyboard.append([InlineKeyboardButton("🔙 Вернуться в главное меню", callback_data='start')])
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                f"🔍 Результаты поиска преподавателя ({len(lecturers)} найдено):\n"
-                "Выберите преподавателя из списка:",
-                reply_markup=reply_markup
-            )
-            return
-
-        # Если ничего не найдено
-        await update.message.reply_text(
-            "❌ Ничего не найдено. Попробуйте изменить запрос.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Вернуться в главное меню", callback_data='start')
-            ]])
-        )
-
-        # Обработка поиска пользователя в админке
-        if context.user_data.get('state') == 'waiting_for_user_search':
-            if update.effective_user.id not in ADMIN_IDS:
+            # Получаем информацию о пользователе
+            user = update.effective_user
+            if not user:
+                await update.message.reply_text("❌ Не удалось определить пользователя")
                 return
             
-            users = self.db.search_user(update.message.text)
-            message = "🔍 <b>Результаты поиска:</b>\n\n"
+            # Проверяем, является ли сообщение командой
+            if message_text.startswith('/'):
+                command = message_text.split('@')[0]  # Убираем username бота из команды
+                if command == '/start':
+                    await self.send_welcome_message(update.message)
+                    return
+                # Добавьте другие команды по необходимости
+                
+            # Существующий код обработки сообщений...
             
-            if users:
-                for user in users:
-                    message += (
-                        f"• ID: {user['tg_id']}\n"
-                        f"  Username: @{user['username'] or 'нет'}\n"
-                        f"  Регистрация: {user['created_at']}\n"
-                        f"  Последняя активность: {user['last_activity']}\n"
-                        f"  Статус: {'🚫 Заблокирован' if user['is_banned'] else '✅ Активен'}\n\n"
-                    )
-            else:
-                message += "❌ Пользователь не найден"
+        except Exception as e:
+            error_msg = f"❌ Произошла ошибка:\n{str(e)}\n"
+            if update.effective_user:
+                error_msg += f"Пользователь ID: {update.effective_user.id}\n"
+                error_msg += f"Username: @{update.effective_user.username}\n"
+            if update.message and update.message.chat:
+                error_msg += f"Чат ID: {update.message.chat.id}"
             
-            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='admin_users')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
-            context.user_data['state'] = None
-            return
-
-        # Обработка состояния ожидания текста для рассылки
-        if context.user_data.get('state') == 'waiting_for_broadcast':
-            if update.effective_user.id not in ADMIN_IDS:
-                return
-            
-            await self.process_broadcast(update, context)
-            return
+            await update.message.reply_text(error_msg)
+            logging.error(f"Error in message handler: {str(e)}", exc_info=True)
 
     async def get_current_week(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда для получения информации о текущей неделе"""
@@ -2993,81 +2763,86 @@ class TelegramBot:
         query = update.callback_query
         group_id = query.data.split('_')[2]
         
-        # Получаем текущие настройки уведомлений
-        notifications = self.db.get_user_notifications(query.from_user.id)
-        current_settings = ""
-        if notifications:
-            current_settings = "\n\nТекущие настройки:\n"
-            for notif in notifications:
-                # Преобразуем время в строку правильным способом
-                time_str = notif['notification_time'].strftime('%H:%M') if isinstance(notif['notification_time'], datetime) else str(notif['notification_time'])
-                current_settings += f"• Группа {notif['groupCode']}: {time_str}\n"
-        
-        message = (
-            "⏰ <b>Выберите время уведомлений</b>\n\n"
-            "В выбранное время вы будете получать расписание на следующий день"
-            f"{current_settings}"
-        )
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("08:00", callback_data=f"set_notify_{group_id}_08:00"),
-                InlineKeyboardButton("12:00", callback_data=f"set_notify_{group_id}_12:00"),
-                InlineKeyboardButton("16:00", callback_data=f"set_notify_{group_id}_16:00")
-            ],
-            [
-                InlineKeyboardButton("20:00", callback_data=f"set_notify_{group_id}_20:00"),
-                InlineKeyboardButton("22:00", callback_data=f"set_notify_{group_id}_22:00")
-            ],
-            [InlineKeyboardButton("❌ Отключить уведомления", callback_data=f"notify_disable_{group_id}")],
-            [InlineKeyboardButton("🔙 Назад", callback_data='notifications')]
-        ]
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
+        try:
+            # Получаем текущие настройки уведомлений
+            notifications = self.db.get_user_notifications(query.from_user.id)
+            current_settings = ""
+            if notifications:
+                current_settings = "\n\nТекущие настройки:\n"
+                for notif in notifications:
+                    time_str = notif['notification_time'].strftime('%H:%M') if isinstance(notif['notification_time'], datetime) else str(notif['notification_time'])
+                    current_settings += f"• Группа {notif['groupCode']}: {time_str}\n"
+            
+            message = (
+                "⏰ <b>Выберите время уведомлений</b>\n\n"
+                "В выбранное время вы будете получать расписание на следующий день"
+                f"{current_settings}"
+            )
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("08:00", callback_data=f"set_notify_{group_id}_08:00"),
+                    InlineKeyboardButton("12:00", callback_data=f"set_notify_{group_id}_12:00")
+                ],
+                [
+                    InlineKeyboardButton("16:00", callback_data=f"set_notify_{group_id}_16:00"),
+                    InlineKeyboardButton("20:00", callback_data=f"set_notify_{group_id}_20:00")
+                ],
+                [InlineKeyboardButton("22:00", callback_data=f"set_notify_{group_id}_22:00")],
+                [InlineKeyboardButton("❌ Отключить уведомления", callback_data=f"notify_disable_{group_id}")],
+                [InlineKeyboardButton("🔙 Назад", callback_data='notifications')]
+            ]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.message.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
+                
+        except Exception as e:
+            logging.error(f"Error in setup_notification_time: {e}")
+            await query.message.edit_text(
+                "❌ Произошла ошибка при настройке уведомлений",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Назад", callback_data='notifications')
+                ]])
+            )
 
     async def check_notifications(self, context: ContextTypes.DEFAULT_TYPE):
         """Проверка и отправка уведомлений"""
-        current_time = datetime.now()
-        users = self.db.get_users_for_notification(current_time)
-        
-        for user in users:
-            try:
-                # Получаем расписание на следующий день
-                tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-                schedule = await self.api.get_schedule(user['groupId'], tomorrow)
-                
-                if schedule:
-                    # Форматируем сообщение с расписанием
-                    message = (
-                        f"📅 Расписание на завтра для группы {user['groupCode']}:\n\n"
-                    )
+        try:
+            # Получаем текущее время в формате HH:MM
+            current_time = datetime.now().strftime('%H:%M')
+            logging.info(f"Checking notifications for time: {current_time}")
+            
+            # Получаем пользователей для текущего времени
+            users = self.db.get_users_for_notification(current_time)
+            logging.info(f"Found {len(users)} users for notifications")
+            
+            for user in users:
+                try:
+                    # Получаем расписание на следующий день
+                    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y%m%d')
+                    schedule = await self.api.get_schedule(str(user['groupId']), date=tomorrow)
                     
-                    # Добавляем информацию о парах
-                    for lesson in schedule:
-                        time = f"{lesson['lessonTimeStart']}-{lesson['lessonTimeEnd']}"
-                        subject = lesson['lessonSubject']['subjectTitle']
-                        room = lesson.get('room', 'Аудитория не указана')
-                        teacher = lesson.get('lecturerName', 'Преподаватель не указан')
-                        
-                        message += (
-                            f"🕒 <b>{time}</b>\n"
-                            f"📚 {subject}\n"
-                            f"🏛 {room}\n"
-                            f"👨‍🏫 {teacher}\n\n"
-                        )
-                else:
-                    message = f"📅 Завтра у группы {user['groupCode']} занятий нет"
-                
-                # Отправляем уведомление
-                await context.bot.send_message(
-                    chat_id=user['tg_id'],
-                    text=message,
-                    parse_mode='HTML'
-                )
-                
-            except Exception as e:
-                logging.error(f"Error sending notification to user {user['tg_id']}: {e}")
+                    if schedule and 'schedule' in schedule:
+                        # Форматируем сообщение
+                        message = self.format_schedule(schedule)
+                        message = f"📅 Расписание на завтра:\n\n{message}"
+                    else:
+                        message = f"📅 На завтра ({tomorrow}) занятий нет"
+                    
+                    # Отправляем уведомление
+                    await context.bot.send_message(
+                        chat_id=user['tg_id'],
+                        text=message,
+                        parse_mode='HTML'
+                    )
+                    logging.info(f"Notification sent to user {user['tg_id']}")
+                    
+                except Exception as e:
+                    logging.error(f"Error sending notification to user {user['tg_id']}: {e}")
+                    continue
+                    
+        except Exception as e:
+            logging.error(f"Error in check_notifications: {e}")
 
     async def cleanup_task(self, context: ContextTypes.DEFAULT_TYPE):
         """Периодическая очистка устаревших данных"""
@@ -3208,23 +2983,27 @@ class TelegramBot:
             await query.answer("⛔️ Нет доступа")
             return
         
-        message = (
-            "📨 <b>Рассылка сообщений</b>\n\n"
-            "Отправьте текст сообщения для рассылки.\n"
-            "Поддерживается HTML-разметка.\n\n"
-            "<i>Примеры использования HTML:</i>\n"
-            "<code>&lt;b&gt;жирный текст&lt;/b&gt;</code>\n"
-            "<code>&lt;i&gt;курсив&lt;/i&gt;</code>\n"
-            "<code>&lt;code&gt;моноширинный&lt;/code&gt;</code>\n"
-            "<code>&lt;a href='URL'&gt;ссылка&lt;/a&gt;</code>\n\n"
-            "Для отмены нажмите кнопку «Отмена»"
-        )
-        
-        keyboard = [[InlineKeyboardButton("🔙 Отмена", callback_data='admin')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.message.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
-        context.user_data['state'] = 'waiting_for_broadcast'
+        try:
+            message = (
+                "📨 <b>Рассылка сообщений</b>\n\n"
+                "Отправьте текст сообщения для рассылки.\n"
+                "Поддерживается HTML-разметка.\n\n"
+                "<i>Примеры использования HTML:</i>\n"
+                "<code>&lt;b&gt;жирный текст&lt;/b&gt;</code>\n"
+                "<code>&lt;i&gt;курсив&lt;/i&gt;</code>\n"
+                "<code>&lt;code&gt;моноширинный&lt;/code&gt;</code>\n"
+                "<code>&lt;a href='URL'&gt;ссылка&lt;/a&gt;</code>\n\n"
+                "Для отмены нажмите кнопку «Отмена»"
+            )
+            
+            keyboard = [[InlineKeyboardButton("🔙 Отмена", callback_data='admin')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.message.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
+            context.user_data['state'] = 'waiting_for_broadcast'
+        except Exception as e:
+            logging.error(f"Error in admin_broadcast_handler: {e}")
+            await query.answer("❌ Произошла ошибка")
 
     async def get_all_users(self):
         """Получение всех пользователей"""
@@ -3294,7 +3073,7 @@ class TelegramBot:
             self.cache_last_update.clear()
             
             # Очищаем Redis кэш если он инициализирован
-            if hasattr(self, 'redis_cache'):
+            if hasattr(self, 'redis_cache') and self.redis_cache:
                 try:
                     self.redis_cache.redis.flushdb()
                 except Exception as e:
@@ -3303,8 +3082,8 @@ class TelegramBot:
             await query.answer("✅ Кэш успешно очищен")
             await self.admin_system_handler(update, context)
         except Exception as e:
-            await query.answer("❌ Ошибка при очистке кэша")
             logging.error(f"Error clearing cache: {e}")
+            await query.answer("❌ Ошибка при очистке кэша")
 
     async def admin_techcard_stats_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Статистика техкарт"""
@@ -3572,6 +3351,76 @@ class TelegramBot:
             logging.error(f"Error in unban_command: {e}")
             await update.message.reply_text("❌ Ошибка при разблокировке пользователя")
 
+    def setup_notification_jobs(self):
+        """Настройка заданий для уведомлений"""
+        try:
+            # Удаляем все существующие задания
+            if hasattr(self.application.job_queue, 'jobs'):
+                for job in self.application.job_queue.jobs():
+                    job.schedule_removal()
+            
+            # Задаем времена для уведомлений
+            notification_times = ['08:00', '12:00', '16:00', '20:00', '22:00']
+            
+            for time_str in notification_times:
+                hour, minute = map(int, time_str.split(':'))
+                # Создаем время для задания
+                target_time = time(hour=hour, minute=minute)
+                
+                # Регистрируем задание
+                self.application.job_queue.run_daily(
+                    self.check_notifications,
+                    time=target_time,
+                    name=f"notify_{time_str}"
+                )
+                logging.info(f"Scheduled notification job for {time_str}")
+                
+        except Exception as e:
+            logging.error(f"Error setting up notification jobs: {e}")
+
 if __name__ == '__main__':
+    # Настраиваем обработку сигналов для корректного завершения
+    async def shutdown_bot(bot, loop):
+        """Корректное завершение работы бота"""
+        try:
+            logging.info("Starting shutdown process from signal handler...")
+            await bot.shutdown()
+            
+            # Отменяем все оставшиеся задачи
+            tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
+            if tasks:
+                logging.info(f"Cancelling {len(tasks)} pending tasks...")
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Закрываем асинхронные генераторы
+            await loop.shutdown_asyncgens()
+            logging.info("Shutdown from signal handler completed")
+        except Exception as e:
+            logging.error(f"Error during shutdown from signal handler: {e}")
+
+    def signal_handler(sig, frame):
+        print('Получен сигнал завершения, закрываем бот...')
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(shutdown_bot(bot, loop))
+                loop.call_soon_threadsafe(loop.stop)
+        except Exception as e:
+            print(f"Ошибка при остановке loop: {e}")
+    
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Запускаем бота
     bot = TelegramBot()
-    bot.run()
+    
+    # Запускаем в asyncio.run()
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        print("Получен сигнал прерывания...")
+    except Exception as e:
+        print(f"Ошибка при запуске бота: {e}")
